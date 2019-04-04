@@ -1,0 +1,455 @@
+#ifndef XPLLOCK_H
+#define XPLLOCK_H
+
+
+/*
+	Platform defines
+
+	The use of these should be limited as much as possible.  Specific tests for
+	features of the platform are prefered.
+*/
+#ifndef LINUX
+#cmakedefine LINUX					1
+#endif
+
+#ifndef WIN32
+#cmakedefine WIN32					1
+#endif
+#ifndef WINDOWS
+#cmakedefine WINDOWS				1
+
+#endif
+
+
+#ifndef MACOSX
+#cmakedefine MACOSX					1
+#endif
+#ifndef DARWIN
+#cmakedefine DARWIN					1
+#endif
+#ifndef APPLE
+#cmakedefine APPLE					1
+#endif
+
+#cmakedefine DEBUG					1
+
+/* TODO: figure out how to get cmake to detect if semephore.h exists */
+#define HAVE_SEMAPHORE_H			1
+
+
+#include <newxpl.h>
+#include <xpltypes.h>
+#include <errno.h>
+
+#ifdef HAVE_SEMAPHORE_H
+# include <semaphore.h>
+#endif
+
+#include <string.h>
+#include <time.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifdef HAVE_DELAY
+# define XplDelay(msec) delay(msec)
+#elif defined (HAVE_SLEEP)
+# define XplDelay(msec) Sleep(msec)
+#else
+# define XplDelay(msec) { struct timeval timeout; timeout.tv_usec=((msec) % 1000) * 1000; timeout.tv_sec=(msec)/1000; select(0, NULL, NULL, NULL, &timeout); }
+#endif
+
+#if defined(LINUX)
+# ifndef __USE_GNU
+#  define __USE_GNU
+#  include <pthread.h>
+#  undef __USE_GNU
+# else
+#  include <pthread.h>
+# endif
+#endif
+
+/*******************************************************************************
+XplMutex
+*******************************************************************************/
+
+#if defined(LINUX)
+#include <signal.h>
+
+typedef pthread_mutex_t	_XplMutex;
+#elif defined(WIN32)
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# include <mswsock.h>
+# include <windows.h>
+
+typedef HANDLE			_XplMutex;
+#else
+# error "Mutexes not implemented on this platform"
+#endif
+
+#ifdef DEBUG
+typedef enum
+{
+	XPL_MUTEX_NOT_READY		= 0,
+	XPL_MUTEX_READY			= 0x12345
+} XplMutexState;
+
+typedef struct
+{
+	_XplMutex		mutex;
+	int				depth;
+	XplMutexState	state;
+
+	struct {
+		const char	*file;
+		int			line;
+	} created;
+
+	struct {
+		const char	*file;
+		int			line;
+	} locked;
+
+	struct {
+		const char	*file;
+		int			line;
+	} released;
+
+	struct {
+		const char	*file;
+		int			line;
+	} destroyed;
+} XplMutex;
+
+#define XplMutexInit(m) {					\
+	(m).created.file = __FILE__;			\
+	(m).created.line = __LINE__;			\
+	(m).depth = 0;							\
+	(m).state = XPL_MUTEX_READY;			\
+	_XplMutexInit( &(m).mutex, TRUE );		\
+}
+
+#define XplMutexDestroy(m) {				\
+	(m).destroyed.file = __FILE__;			\
+	(m).destroyed.line = __LINE__;			\
+	_XplMutexDestroy( &(m).mutex );			\
+}
+
+#define XplMutexLock(m) {					\
+	CriticalAssert(XPL_MUTEX_READY == (m).state);\
+	_XplMutexLock( &(m).mutex );			\
+	if (0 == (m).depth) {					\
+		(m).locked.file = __FILE__;			\
+		(m).locked.line = __LINE__;			\
+	}										\
+	(m).depth++;							\
+}
+
+#define XplMutexUnlock(m) {					\
+	CriticalAssert(XPL_MUTEX_READY == (m).state);\
+	(m).depth--;							\
+	if (0 == (m).depth) {					\
+		(m).released.file = __FILE__;		\
+		(m).released.line = __LINE__;		\
+	}										\
+	_XplMutexUnlock( &(m).mutex );			\
+}
+
+/* End DEBUG */
+#else
+/* NOT DEBUG */
+
+typedef struct
+{
+	_XplMutex		mutex;
+	int				depth;
+} XplMutex;
+
+#define XplMutexInit(m) {					\
+	(m).depth = 0;							\
+	_XplMutexInit( &(m).mutex, TRUE );		\
+}
+
+#define XplMutexDestroy(m) {				\
+	_XplMutexDestroy( &(m).mutex );			\
+}
+
+#define XplMutexLock(m) {					\
+	_XplMutexLock( &(m).mutex );			\
+	(m).depth++;							\
+}
+
+#define XplMutexUnlock(m) {					\
+	(m).depth--;							\
+	_XplMutexUnlock( &(m).mutex );			\
+}
+
+#endif /* End NOT DEBUG */
+
+EXPORT int _XplMutexInit( _XplMutex *mutex, XplBool recursive );
+EXPORT int _XplMutexDestroy( _XplMutex *mutex );
+EXPORT int _XplMutexLock( _XplMutex *mutex );
+EXPORT int _XplMutexUnlock( _XplMutex *mutex );
+
+/*******************************************************************************
+End XplMutex
+*******************************************************************************/
+
+
+
+/*******************************************************************************
+XplLock
+
+The XplLock is a hybrid spinlock/mutex that acts as a code serialization lock to
+protect data, like spinlocks or mutexes the code should never call any API that
+will explicitly generate a thread context switch.  On Linux and Windows these
+locks DO cause an explicit context switch on a miss because we are running in
+user mode.
+
+It is safe to recursively lock an XplMutex but doing this with an XplLock is not
+permitted.
+
+XplLock also avoids modifying errno, but XplMutex will set errno.
+*******************************************************************************/
+#if defined(LINUX)
+typedef XplMutex							XplLock;
+
+# define XplLockInit(m) {					\
+	int xpllock_prev_errno = errno;			\
+	XplMutexInit(*(m));						\
+	errno = xpllock_prev_errno;				\
+}
+# define XplLockDestroy(m) {				\
+	int xpllock_prev_errno = errno;			\
+	XplMutexDestroy(*(m))					\
+	errno = xpllock_prev_errno;				\
+}
+
+# define XplLockAcquire(m) {				\
+	int xpllock_prev_errno = errno;			\
+	XplMutexLock( *(m) );					\
+	/*DebugAssert(1 == (*(m)).depth);*/		\
+	errno = xpllock_prev_errno;				\
+}
+
+# define XplLockRelease(m) {				\
+	int xpllock_prev_errno = errno;			\
+	XplMutexUnlock( *(m) );					\
+	errno = xpllock_prev_errno;				\
+}
+
+# define XplLockUpdateOwner(m, f, i)
+# define XplLockValue(m)					(*(m)).depth
+#elif defined(WIN32)
+typedef LONG								XplLock;
+
+# define XplLockInit(l)						*(l) = (LONG) 0
+# define XplLockAcquire(l)					while (InterlockedExchange((l), (LONG)1)) { XplDelay(1); }
+# define XplLockValue(l)					*(l)
+# define XplLockUpdateOwner(l, f, i)
+# define XplLockRelease(l)					InterlockedExchange((l), (LONG) 0)
+#endif
+
+
+/*******************************************************************************
+XplAtomic
+
+The XplSafe functions implement atomics, the atomics are 32 bit unsigned values
+*******************************************************************************/
+#define XPL_ATOMIC_FLAG_IGNORE_HIGHBIT		0x00000001
+
+#if defined(LINUX)
+# define ATOMIC_SIG							0x1234fedc
+typedef struct
+{
+	XplLock									lock;
+	unsigned long							value;
+
+#  ifdef DEBUG
+	unsigned long							flags;
+	unsigned long							signature;
+	char									*id;
+#  endif
+} XplAtomic;
+
+#endif // END LINUX
+
+#if defined(LINUX)
+# ifdef DEBUG
+void _XplSafeInit			( XplAtomic *variable, unsigned long value, char *id, const char *file, const int line );
+void _XplSafeFlag			( XplAtomic *variable, unsigned long flags, const char *file, const int line);
+
+unsigned long _XplSafeRead	( XplAtomic *variable, const char *file, const int line );
+unsigned long _XplSafeWrite	( XplAtomic *variable, unsigned long value, const char *file, const int line );
+unsigned long _XplSafeAdd	( XplAtomic *variable, unsigned long value, const char *file, const int line );
+unsigned long _XplSafeAnd	( XplAtomic *variable, unsigned long value, const char *file, const int line );
+unsigned long _XplSafeOr	( XplAtomic *variable, unsigned long value, const char *file, const int line );
+
+#  define XplSafeInitTrace( V, v, id )			_XplSafeInit( &(V),(v), (id), __FILE__, __LINE__ )
+#  define XplSafeInit( V, v )					_XplSafeInit( &(V),(v), NULL, __FILE__, __LINE__ )
+#  define XplSafeFlag(V, f)						_XplSafeFlag(&(V), (f), __FILE__, __LINE__)
+
+#  define XplSafeRead( V )						_XplSafeRead( &(V), __FILE__, __LINE__ )
+#  define XplSafeWrite( V, v )					_XplSafeWrite( &(V), (v), __FILE__, __LINE__ )
+#  define XplSafeIncrement( V )					_XplSafeAdd( &(V),  1, __FILE__, __LINE__ )
+#  define XplSafeDecrement( V )					_XplSafeAdd( &(V), -1, __FILE__, __LINE__ )
+#  define XplSafeAdd( V, v )					_XplSafeAdd( &(V), (v), __FILE__, __LINE__ )
+#  define XplSafeSub( V, v )					_XplSafeAdd( &(V), (-1 * (v)), __FILE__, __LINE__ )
+#  define XplSafeAnd( V, v )					_XplSafeAnd( &(V), (v), __FILE__, __LINE__ )
+#  define XplSafeOr( V, v )						_XplSafeOr( &(V), (v), __FILE__, __LINE__ )
+
+# else // DEBUG
+void _XplSafeInit			( XplAtomic *variable, unsigned long value );
+unsigned long _XplSafeRead	( XplAtomic *variable );
+unsigned long _XplSafeWrite	( XplAtomic *variable, unsigned long value );
+unsigned long _XplSafeAdd	( XplAtomic *variable, unsigned long value );
+unsigned long _XplSafeAnd	( XplAtomic *variable, unsigned long value );
+unsigned long _XplSafeOr	( XplAtomic *variable, unsigned long value );
+
+#  define XplSafeInitTrace( V, v, id )			_XplSafeInit( &(V),(v), NULL )
+#  define XplSafeInit( V, v )					_XplSafeInit( &(V),(v) )
+#  define XplSafeFlag(V, f)
+
+#  define XplSafeRead( V )						_XplSafeRead( &(V) )
+#  define XplSafeWrite( V, v )					_XplSafeWrite( &(V), (v) )
+#  define XplSafeIncrement( V )					_XplSafeAdd( &(V),  1 )
+#  define XplSafeDecrement( V )					_XplSafeAdd( &(V), -1 )
+#  define XplSafeAdd( V, v )					_XplSafeAdd( &(V), (v) )
+#  define XplSafeSub( V, v )					_XplSafeAdd( &(V), (-1 * (v)) )
+#  define XplSafeAnd( V, v )					_XplSafeAnd( &(V), (v) )
+#  define XplSafeOr( V, v )						_XplSafeOr( &(V), (v) )
+
+# endif // !DEBUG
+
+#elif defined(WIN32)
+
+
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# include <mswsock.h>
+# include <windows.h>
+
+
+typedef LONG									XplAtomic;
+# define XplSafeInitTrace(Variable, Value, id)	InterlockedExchange(&(Variable), (Value))
+# define XplSafeInit(Variable, Value)			InterlockedExchange(&(Variable), (Value))
+# define XplSafeFlag(Variabe, Value)
+# define XplSafeRead(Variable)					(Variable)
+# define XplSafeWrite(Variable, Value)			InterlockedExchange(&(Variable), (Value))
+# define XplSafeIncrement(Variable)				InterlockedIncrement(&(Variable))
+# define XplSafeDecrement(Variable)				InterlockedDecrement(&(Variable))
+# define XplSafeAdd(Variable, Value)			InterlockedExchangeAdd(&(Variable), (Value))
+# define XplSafeSub(Variable, Value)			InterlockedExchangeAdd(&(Variable), -1*(Value))
+# ifdef INTERLOCKED_AND_OR
+#  define XplSafeAnd(Variable, Value)			InterlockedAnd(&(Variable), (Value))
+#  define XplSafeOr(Variable, Value)			InterlockedOr(&(Variable), (Value))
+# else
+#  define XplSafeAnd(Variable, Value)			InterlockedExchange(&(Variable), (Variable & Value))
+#  define XplSafeOr(Variable, Value)			InterlockedExchange(&(Variable), (Variable | Value))
+# endif
+
+#else
+# error "Safe variable operations not implemented on this platform"
+#endif
+
+/*******************************************************************************
+End XplSafe
+*******************************************************************************/
+
+
+#if defined(HAVE_SEMAPHORE_H) && !defined(MACOSX)
+#elif defined(WIN32)
+#else
+# error "Semaphores not implemented on this platform"
+#endif
+
+/*******************************************************************************
+Semaphores
+*******************************************************************************/
+#if defined(LINUX) || defined(S390RH) || defined(MACOSX)
+typedef sem_t			_XplSema;
+#elif defined(WIN32)
+typedef HANDLE			_XplSema;
+#else
+# error "Semaphores not implemented on this platform"
+#endif
+
+EXPORT int _XplSemaInit( _XplSema *sema, int initialCount );
+EXPORT int _XplSemaDestroy( _XplSema *sema );
+EXPORT int _XplSemaWait( _XplSema *sema );
+EXPORT int _XplSemaTimedWait( _XplSema *sema, int64 milliseconds );
+EXPORT int _XplSemaPost( _XplSema *sema );
+EXPORT int _XplSemaValue( _XplSema *sema, int *value );
+
+typedef struct
+{
+	_XplMutex	mutex;
+	_XplSema	sema;
+}XplCondVariable;
+
+EXPORT int XplCondInit( XplCondVariable *var );
+EXPORT int XplCondDestroy( XplCondVariable *var );
+EXPORT int XplCondWait( XplCondVariable *var, int64 milliseconds );
+EXPORT int XplCondSignal( XplCondVariable *var );
+EXPORT int XplCondLock( XplCondVariable *var );
+EXPORT int XplCondUnlock( XplCondVariable *var );
+
+#ifdef DEBUG
+typedef struct
+{
+	_XplSema	s;
+	_XplSema	*p;
+} XplSemaphore;
+
+EXPORT int __XplSemaInit( XplSemaphore *sema, int initialCount );
+EXPORT int __XplSemaDestroy( XplSemaphore *sema );
+EXPORT int __XplSemaWait( XplSemaphore *sema );
+EXPORT int __XplSemaTimedWait( XplSemaphore *sema, int64 milliseconds );
+EXPORT int __XplSemaPost( XplSemaphore *sema );
+EXPORT int __XplSemaValue( XplSemaphore *sema, int *value );
+#define XplSemaInit( sem, value )		__XplSemaInit( &(sem), (value) )
+#define XplSemaDestroy( sem )			__XplSemaDestroy( &(sem) )
+#define XplSemaWait( sem )				__XplSemaWait( &(sem) )
+#define XplSemaTimedWait( sem, milli )	__XplSemaTimedWait( &(sem), milli )
+#define XplSemaPost( sem )				__XplSemaPost( &(sem) )
+#define XplSemaValue( sem, value )		__XplSemaValue( &(sem), (value) )
+
+#else	// DEBUG
+typedef _XplSema	XplSemaphore;
+
+#define XplSemaInit( sem, value )		_XplSemaInit( &(sem), (value) )
+#define XplSemaDestroy( sem )			_XplSemaDestroy( &(sem) )
+#define XplSemaWait( sem )				_XplSemaWait( &(sem) )
+#define XplSemaTimedWait( sem, milli )	_XplSemaTimedWait( &(sem), milli )
+#define XplSemaPost( sem )				_XplSemaPost( &(sem) )
+#define XplSemaValue( sem, value )		_XplSemaValue( &(sem), (value) )
+#endif	// DEBUG
+
+# define XplDelayOnLocalSemaphore(sem, timeout, result)			\
+{																\
+	if( !XplSemaTimedWait( (sem), (timeout) ) ) (result) = 0;	\
+	else if( ETIMEDOUT == errno )    (result) = 1;				\
+	else    (result) = -1;										\
+}
+
+
+/* Read/Write locks */
+typedef struct {
+   long				RWState;
+   unsigned long	RWMode;
+   unsigned long	RWReaders;
+   XplSemaphore		RWLock;
+   XplSemaphore		RWMutexRead;
+   XplSemaphore		RWMutexReadWrite;
+} XplRWLock;
+
+EXPORT XplBool   XplRWLockInit(XplRWLock *RWLock);
+EXPORT XplBool   XplRWLockDestroy(XplRWLock *RWLock);
+EXPORT XplBool   XplRWReadLockAcquire(XplRWLock *RWLock);
+EXPORT XplBool   XplRWWriteLockAcquire(XplRWLock *RWLock);
+EXPORT XplBool   XplRWReadLockRelease(XplRWLock *RWLock);
+EXPORT XplBool   XplRWWriteLockRelease(XplRWLock *RWLock);
+
+#endif //XPLLOCK_H
